@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}一致性审计 #{{ run.id }} · 流式线性回归标定{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="headline">
+    <h1>一致性审计 · 训练 #{{ run.id }}</h1>
+    {% if result.ok %}
+    <span class="badge badge-finished">通过</span>
+    {% else %}
+    <span class="badge badge-failed">发现 {{ result.problem_count }} 处不一致</span>
+    {% endif %}
+  </div>
+  <p class="muted">
+    本次审计只核对开始审计时读到的那一个已提交断点（<span class="mono">{{ result.updates }}</span> 组更新、
+    <span class="mono">{{ result.samples }}</span> 个样本），以及该断点涵盖的组更新。
+    审计期间训练仍可提交新的组，不会计入本次结果，也不会造成误报。
+  </p>
+  <p class="small muted">
+    <a href="{{ url_for('run_detail', run_id=run.id) }}">返回训练详情</a> ·
+    <a href="{{ url_for('api_audit', run_id=run.id) }}">审计 JSON</a> ·
+    <a href="{{ url_for('api_run', run_id=run.id) }}">当前进度 JSON</a>
+  </p>
+
+  <div class="metrics audit-metrics">
+    <div class="metric"><span class="label">断点组数</span><span class="value">{{ result.updates }}</span></div>
+    <div class="metric"><span class="label">断点样本数</span><span class="value">{{ result.samples }}</span></div>
+    <div class="metric"><span class="label">w</span><span class="value mono">{{ '%.10g'|format(result.w) }}</span></div>
+    <div class="metric"><span class="label">b</span><span class="value mono">{{ '%.10g'|format(result.b) }}</span></div>
+    <div class="metric"><span class="label">动量 v_w</span><span class="value mono">{{ '%.10g'|format(result.v_w) }}</span></div>
+    <div class="metric"><span class="label">动量 v_b</span><span class="value mono">{{ '%.10g'|format(result.v_b) }}</span></div>
+  </div>
+
+  <details class="precise" open>
+    <summary>全精度数值</summary>
+    <pre>w = {{ '%.17g'|format(result.w) }}
+b = {{ '%.17g'|format(result.b) }}
+v_w = {{ '%.17g'|format(result.v_w) }}
+v_b = {{ '%.17g'|format(result.v_b) }}
+重放（由更新记录重建）：
+w = {{ '%.17g'|format(result.replayed.w) }}
+b = {{ '%.17g'|format(result.replayed.b) }}
+v_w = {{ '%.17g'|format(result.replayed.v_w) }}
+v_b = {{ '%.17g'|format(result.replayed.v_b) }}
+更新 = {{ result.replayed.updates }}，样本 = {{ result.replayed.samples }}</pre>
+  </details>
+</section>
+
+<section class="card">
+  <h2>审计结果</h2>
+  {% if result.ok %}
+  <p class="flash flash-ok">
+    断点的参数、动量、样本累计与全部 {{ result.updates }} 条更新记录逐一吻合。
+  </p>
+  {% else %}
+  <p class="flash flash-error">
+    共发现 <strong>{{ result.problem_count }}</strong> 处不一致；下面列出最先发现的
+    {{ result.problems|length }} 条{% if result.problems_truncated %}（最多显示 {{ result.max_problems }} 条）{% endif %}。
+  </p>
+  <ol class="problems">
+    {% for problem in result.problems %}
+    <li>{{ problem }}</li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+  <p class="muted small">
+    断点状态：{{ status_badge(run.status) }}
+    <span class="mono">{{ run.original_name }}</span> ·
+    组内已读未更新 {{ result.part_rows }} 行 ·
+    总行数 {{ run.total_rows }} ·
+    每组 {{ run.group_size }} 行
+  </p>
+</section>
+{% endblock %}

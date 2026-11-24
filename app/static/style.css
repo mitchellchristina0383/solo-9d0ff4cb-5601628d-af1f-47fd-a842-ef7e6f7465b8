@@ -64,6 +64,9 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: non
 tbody tr:hover { background: #fafbfc; }
 .headline { display: flex; align-items: center; gap: 12px; }
 .metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin: 14px 0 12px; }
+.audit-metrics { margin-top: 10px; }
+.problems { margin: 10px 0 0; padding-left: 26px; color: var(--bad); }
+.problems li { margin: 3px 0; }
 .metric { background: #f8fafc; border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; display: flex; flex-direction: column; }
 .metric .label { color: var(--muted); font-size: 12px; }
 .metric .value { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }

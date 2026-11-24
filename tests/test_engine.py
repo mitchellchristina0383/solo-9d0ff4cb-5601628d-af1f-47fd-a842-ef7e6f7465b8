@@ -400,6 +400,147 @@ class TestCrashResume(Base):
             return fh.tell()
 
 
+class TestAuditSnapshot(Base):
+    """The audit must check one checkpoint, even while training commits groups."""
+
+    def test_audit_during_commits_uses_starting_checkpoint(self):
+        write_csv(self.csv, make_rows(400))
+        rid = self.create(group_size=10, chunk_limit=5)
+        engine.train(self.conn, rid, self.csv, max_updates=3)
+        started = self.run_row(rid)
+        committed_during: list[int] = []
+
+        def commit_more():
+            # A second connection, like the training thread racing the audit.
+            other = engine.connect(self.db)
+            try:
+                engine.train(other, rid, self.csv, max_updates=2)
+                committed_during.append(int(engine.get_run(other, rid)["updates_done"]))
+            finally:
+                other.close()
+
+        result = engine.audit(self.conn, rid, snapshot_hook=commit_more)
+        self.assertEqual(committed_during, [started["updates_done"] + 2])
+        self.assertTrue(result["ok"], result["problems"])
+        # Exactly the checkpoint read at the start, not the newer state.
+        self.assertEqual(result["updates"], started["updates_done"])
+        self.assertEqual(result["samples"], started["samples_done"])
+        self.assertEqual(result["w"], started["w"])
+        self.assertEqual(result["b"], started["b"])
+        self.assertEqual(result["v_w"], started["v_w"])
+        self.assertEqual(result["v_b"], started["v_b"])
+        # A fresh audit sees the newer checkpoint and still agrees with it.
+        after = engine.audit(self.conn, rid)
+        self.assertTrue(after["ok"], after["problems"])
+        self.assertEqual(after["updates"], started["updates_done"] + 2)
+
+    def test_audit_reports_checkpoint_values_not_latest(self):
+        write_csv(self.csv, make_rows(200))
+        rid = self.create(group_size=10, chunk_limit=5)
+        engine.train(self.conn, rid, self.csv, max_updates=4)
+        started = self.run_row(rid)
+        result = engine.audit(self.conn, rid)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["updates"], started["updates_done"])
+        self.assertEqual(result["samples"], started["samples_done"])
+        self.assertEqual(result["w"], started["w"])
+        self.assertEqual(result["b"], started["b"])
+        self.assertEqual(result["v_w"], started["v_w"])
+        self.assertEqual(result["v_b"], started["v_b"])
+
+    def test_audit_after_several_commits_has_no_false_problem(self):
+        write_csv(self.csv, make_rows(300))
+        rid = self.create(group_size=10, chunk_limit=5)
+        engine.train(self.conn, rid, self.csv, max_updates=2)
+        engine.train(self.conn, rid, self.csv, max_updates=2)
+        result = engine.audit(self.conn, rid)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["problem_count"], 0)
+
+    def test_audit_of_deleted_run_reports_deleted(self):
+        write_csv(self.csv, make_rows(20))
+        rid = self.create(group_size=5)
+        engine.train(self.conn, rid, self.csv, max_updates=1)
+        engine.delete_run(self.conn, rid)
+        with self.assertRaises(engine.InputError):
+            engine.audit(self.conn, rid)
+
+    def test_audit_survives_delete_after_snapshot(self):
+        write_csv(self.csv, make_rows(60))
+        rid = self.create(group_size=10, chunk_limit=5)
+        engine.train(self.conn, rid, self.csv)
+        before = self.run_row(rid)
+
+        def delete_now():
+            other = engine.connect(self.db)
+            try:
+                engine.delete_run(other, rid)
+            finally:
+                other.close()
+
+        result = engine.audit(self.conn, rid, snapshot_hook=delete_now)
+        # Snapshot still holds the complete checkpoint: full result, no error.
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual(result["updates"], before["updates_done"])
+        self.assertEqual(result["samples"], before["samples_done"])
+        self.assertEqual(result["w"], before["w"])
+        with self.assertRaises(engine.InputError):
+            engine.audit(self.conn, rid)
+
+    def test_problem_list_is_capped_but_counted(self):
+        write_csv(self.csv, make_rows(400))
+        rid = self.create(group_size=10, chunk_limit=5)
+        engine.train(self.conn, rid, self.csv, max_updates=40)
+        # Give 40 audit rows a starting offset that does not chain to the
+        # previous group's end: one reportable problem per row.
+        with engine.transaction(self.conn):
+            cur = self.conn.execute(
+                "UPDATE updates SET offset_before=offset_before+1 "
+                "WHERE run_id=? AND idx<?", (rid, 40))
+            self.assertEqual(cur.rowcount, 40)
+        result = engine.audit(self.conn, rid)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["problem_count"], 40)
+        self.assertEqual(len(result["problems"]), 10)
+        self.assertEqual(result["max_problems"], 10)
+        self.assertTrue(result["problems_truncated"])
+
+    def test_audit_memory_is_flat_in_number_of_groups(self):
+        import gc
+        import tracemalloc
+
+        def peak_for(groups: int) -> int:
+            path = os.path.join(self.tmp, f"m{groups}.db")
+            csv = os.path.join(self.tmp, f"m{groups}.csv")
+            # Small, well-conditioned values so 1500 groups cannot diverge.
+            write_csv(csv, [(float(i % 20) * 0.1 - 1.0,
+                             1.5 * (float(i % 20) * 0.1 - 1.0)) for i in range(groups * 5)])
+            conn = engine.connect(path)
+            try:
+                rid = engine.create_run(
+                    conn, csv, f"m{groups}.csv", csv, group_size=5,
+                    chunk_limit=5, lr=0.0001, momentum=0.5,
+                    init_w=0.0, init_b=0.0)
+                engine.train(conn, rid, csv)
+                gc.collect()
+                tracemalloc.start()
+                before = tracemalloc.get_traced_memory()[0]
+                result = engine.audit(conn, rid)
+                peak = tracemalloc.get_traced_memory()[1]
+                tracemalloc.stop()
+                self.assertTrue(result["ok"], result["problems"])
+                self.assertEqual(result["updates"], groups)
+                return peak - before
+            finally:
+                conn.close()
+
+        small = peak_for(50)
+        large = peak_for(1500)
+        # 30x the groups must not grow audit memory by anything close to 30x.
+        self.assertLess(large, max(small * 4, 256 * 1024),
+                        f"audit memory grew with groups: {small} -> {large}")
+
+
 class TestDivergence(Base):
     def test_divergence_fails_cleanly(self):
         # inverse-variance blow-up: w oscillates and overflows within a few groups

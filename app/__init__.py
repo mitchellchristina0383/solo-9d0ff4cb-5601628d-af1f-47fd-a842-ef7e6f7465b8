@@ -219,9 +219,19 @@ def create_app(config: dict | None = None) -> Flask:
             try:
                 result = engine.audit(conn, run_id)
             except engine.InputError:
-                abort(404)
+                return jsonify(error=f"训练 #{run_id} 不存在（可能已被删除）"), 404
         result["run"] = dict(result["run"])
         return jsonify(result)
+
+    @app.get("/runs/<int:run_id>/audit")
+    def run_audit(run_id: int):
+        """Consistency audit page, opened from the training detail page."""
+        with db() as conn:
+            try:
+                result = engine.audit(conn, run_id)
+            except engine.InputError:
+                abort(404)
+        return render_template("audit.html", result=result, run=result["run"])
 
     @app.post("/runs/<int:run_id>/start")
     def run_start(run_id: int):

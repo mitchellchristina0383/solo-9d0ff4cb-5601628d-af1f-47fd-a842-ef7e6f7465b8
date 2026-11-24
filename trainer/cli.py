@@ -73,7 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     conn = engine.connect(args.db)
     try:
         if args.cmd == "audit":
-            result = engine.audit(conn, args.run_id)
+            try:
+                result = engine.audit(conn, args.run_id)
+            except engine.InputError as exc:
+                print(json.dumps({"ok": False, "deleted": True, "error": str(exc)},
+                                 indent=2, ensure_ascii=False))
+                return 2
             result["run"] = dict(result["run"])
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0 if result["ok"] else 1

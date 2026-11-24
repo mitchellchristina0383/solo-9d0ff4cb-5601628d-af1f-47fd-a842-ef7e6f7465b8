@@ -109,6 +109,7 @@ v_b = {{ '%.17g'|format(run.v_b) }}</pre>
   </table>
   <p class="muted small">
     每行对应一次参数更新；参数、动量与已计入进度在同一事务中提交，因此该表就是可复核的更新轨迹。
+    <a class="button" href="{{ url_for('run_audit', run_id=run.id) }}">打开一致性审计</a>
     <a href="{{ url_for('api_audit', run_id=run.id) }}">查看一致性审计 JSON</a>
   </p>
 </section>

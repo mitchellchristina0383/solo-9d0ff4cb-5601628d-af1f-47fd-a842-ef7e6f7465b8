@@ -162,6 +162,72 @@ class TestWebFlow(unittest.TestCase):
         with engine.session(self.app.config["DB_PATH"]) as conn:
             self.assertEqual(engine.list_runs(conn), [])
 
+    def test_audit_page_from_detail_and_json(self):
+        self.upload()
+        with engine.session(self.app.config["DB_PATH"]) as conn:
+            run_id = engine.list_runs(conn)[0]["id"]
+        self.client.post(f"/runs/{run_id}/start", data={"pause_after": ""})
+        body = wait_idle(self.app, run_id)
+        self.assertEqual(body["run"]["status"], "finished")
+
+        detail = self.client.get(f"/runs/{run_id}").get_data(as_text=True)
+        self.assertIn("打开一致性审计", detail)
+        self.assertIn(f"/runs/{run_id}/audit", detail)
+
+        page = self.client.get(f"/runs/{run_id}/audit")
+        self.assertEqual(page.status_code, 200)
+        html = page.get_data(as_text=True)
+        self.assertIn("一致性审计", html)
+        self.assertIn("断点组数", html)
+        self.assertIn("通过", html)
+        self.assertIn("断点样本数", html)
+
+        audit = self.client.get(f"/api/runs/{run_id}/audit").get_json()
+        self.assertTrue(audit["ok"], audit["problems"])
+        self.assertEqual(audit["updates"], body["run"]["updates_done"])
+        self.assertEqual(audit["samples"], body["run"]["samples_done"])
+        self.assertEqual(audit["w"], body["run"]["w"])
+        self.assertEqual(audit["b"], body["run"]["b"])
+        self.assertEqual(audit["v_w"], body["run"]["v_w"])
+        self.assertEqual(audit["v_b"], body["run"]["v_b"])
+        self.assertEqual(audit["problem_count"], 0)
+        self.assertEqual(audit["problems"], [])
+
+    def test_audit_of_deleted_run_is_reported(self):
+        self.upload()
+        with engine.session(self.app.config["DB_PATH"]) as conn:
+            run_id = engine.list_runs(conn)[0]["id"]
+        self.client.post(f"/runs/{run_id}/delete")
+        self.assertEqual(self.client.get(f"/runs/{run_id}/audit").status_code, 404)
+        resp = self.client.get(f"/api/runs/{run_id}/audit")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("删除", resp.get_json()["error"])
+
+    def test_audit_while_training_reports_starting_checkpoint(self):
+        """Polling the audit during an active run must not false-alarm."""
+        big = "x,y\n" + "".join(f"{i * 0.001},{2.0 * i * 0.001}\n" for i in range(60000))
+        self.upload(csv=(io.BytesIO(big.encode()), "big.csv"),
+                    group_size="100", chunk_limit="7", lr="0.00001")
+        with engine.session(self.app.config["DB_PATH"]) as conn:
+            run_id = engine.list_runs(conn)[0]["id"]
+        self.client.post(f"/runs/{run_id}/start", data={"pause_after": ""})
+
+        seen_checkpoints = []
+        for _ in range(200):
+            audit = self.client.get(f"/api/runs/{run_id}/audit").get_json()
+            self.assertTrue(audit["ok"], audit["problems"])
+            self.assertEqual(audit["problem_count"], 0)
+            seen_checkpoints.append(audit["updates"])
+            with engine.session(self.app.config["DB_PATH"]) as conn:
+                status = engine.get_run(conn, run_id)["status"]
+            if status == "finished":
+                break
+            time.sleep(0.002)
+        # Audit results advanced as groups committed, never an inconsistency.
+        self.assertTrue(seen_checkpoints)
+        self.assertEqual(seen_checkpoints, sorted(seen_checkpoints))
+        self.assertGreater(len(set(seen_checkpoints)), 1)
+
     def test_delete_removes_file(self):
         self.upload()
         with engine.session(self.app.config["DB_PATH"]) as conn:

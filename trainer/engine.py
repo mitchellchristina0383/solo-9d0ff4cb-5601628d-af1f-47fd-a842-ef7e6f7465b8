@@ -363,6 +363,26 @@ def transaction(conn: sqlite3.Connection):
         raise
 
 
+@contextlib.contextmanager
+def read_snapshot(conn: sqlite3.Connection):
+    """Hold one WAL read snapshot for a group of SELECTs.
+
+    ``BEGIN`` is deferred, so the snapshot is fixed by the first read and every
+    later query on this connection sees the same committed state.  A training
+    thread may keep committing groups meanwhile; they are simply invisible here.
+    """
+    if conn.in_transaction:
+        # Caller already owns a transaction/snapshot; do not nest one.
+        yield conn
+        return
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
+
+
 def recover(conn: sqlite3.Connection) -> int:
     """Startup recovery: a 'running' row can only be left by a dead process.
 
@@ -926,68 +946,152 @@ def reference_fit(
     }
 
 
-def audit(conn: sqlite3.Connection, run_id: int) -> dict:
-    """Replay the update chain and check parameters, momentum and progress agree."""
-    run = get_run(conn, run_id)
-    rows = conn.execute(
-        "SELECT * FROM updates WHERE run_id=? ORDER BY idx", (run_id,)
-    ).fetchall()
-    w, b, v_w, v_b = run["init_w"], run["init_b"], 0.0, 0.0
-    problems: list[str] = []
-    samples = 0
-    prev_offset = int(run["data_start"])
-    for expect, rec in enumerate(rows):
-        if rec["idx"] != expect:
-            problems.append(f"更新序号不连续：期望 {expect}，实际 {rec['idx']}")
-        if rec["offset_before"] != prev_offset:
-            problems.append(f"更新 {rec['idx']} 的起始偏移与上次结束偏移不衔接")
-        prev_offset = int(rec["offset_after"])
-        samples += int(rec["samples"])
-        v_w = run["momentum"] * v_w - run["lr"] * rec["grad_w"]
-        v_b = run["momentum"] * v_b - run["lr"] * rec["grad_b"]
-        w += v_w
-        b += v_b
-        if not (w == rec["w_after"] and b == rec["b_after"]):
-            problems.append(f"更新 {rec['idx']} 的参数与审计记录不一致")
-        if not (v_w == rec["v_w"] and v_b == rec["v_b"]):
-            problems.append(f"更新 {rec['idx']} 的动量与审计记录不一致")
-    if samples != run["samples_done"]:
-        problems.append(f"样本累计不一致：审计 {samples}，进度 {run['samples_done']}")
-    if len(rows) != run["updates_done"]:
-        problems.append(f"更新数不一致：审计 {len(rows)}，进度 {run['updates_done']}")
-    if not (w == run["w"] and b == run["b"]):
-        problems.append("最终参数与进度记录不一致")
-    if not (v_w == run["v_w"] and v_b == run["v_b"]):
-        problems.append("最终动量与进度记录不一致")
-    part_rows = int(run["part_rows"])
-    if part_rows < 0 or part_rows >= max(1, int(run["group_size"])):
-        problems.append("未成组的累计行数超出每组样本数")
-    if samples + part_rows > run["total_rows"]:
-        problems.append("已计入样本 + 未成组行数超过总行数")
-    if part_rows == 0:
-        if run["next_offset"] != prev_offset:
-            problems.append("next_offset 与最后一条更新记录不一致")
-        if int(run["part_gw"]) != 0 or int(run["part_loss"]) != 0:
-            problems.append("未成组累计应为空")
-    else:
-        if run["next_offset"] == prev_offset:
-            problems.append("存在未成组累计但读取偏移未前进")
-        if int(run["part_start_offset"]) != prev_offset:
-            problems.append("未成组的起始偏移与上次结束偏移不衔接")
-    if run["status"] == "finished":
-        if samples != run["total_rows"] or part_rows != 0:
-            problems.append("已结束但样本数不等于总行数")
-        if len(rows) != (run["total_rows"] + run["group_size"] - 1) // run["group_size"]:
-            problems.append("已结束但更新次数不等于组数")
+AUDIT_MAX_PROBLEMS = 10
+
+# Only the columns the replay needs: keeps each fetched record small.
+_AUDIT_ROW_COLUMNS = (
+    "idx, samples, offset_before, offset_after, grad_w, grad_b, "
+    "v_w, v_b, w_after, b_after"
+)
+
+
+def audit(conn: sqlite3.Connection, run_id: int,
+          snapshot_hook: Optional[Callable[[], None]] = None) -> dict:
+    """Verify one committed checkpoint and exactly the group updates it covers.
+
+    A single WAL read snapshot is taken first, so the checkpoint (``runs`` row)
+    and the audit rows are read from the same committed state.  A training
+    thread may keep committing new groups while this runs; those commits are
+    invisible here and cannot produce a false "checkpoint damaged" report.  If
+    the run is deleted after the snapshot is taken, the snapshot still yields
+    the complete result; if it is already gone, ``InputError`` is raised.
+
+    Updates are streamed one row at a time (never ``fetchall``) and only the
+    first ``AUDIT_MAX_PROBLEMS`` messages are retained, so a single audit uses
+    constant memory regardless of how many groups exist.
+
+    The returned ``updates``/``samples``/``w``/``b``/``v_w``/``v_b`` describe
+    the checkpoint itself; ``replayed`` holds the values reconstructed from the
+    update chain for diagnosis.  ``problem_count`` is the total number of
+    inconsistencies found, ``problems`` the first (at most ten) in discovery
+    order.
+
+    ``snapshot_hook`` is a test-only injection point: it runs after the
+    snapshot is fixed and before the checkpoint is read, so a test can commit
+    more groups and prove they are invisible to this audit.
+    """
+    with read_snapshot(conn):
+        if snapshot_hook is not None:
+            # Fix the snapshot with a harmless read, then let the hook race a
+            # writer before the checkpoint itself is read.
+            conn.execute("SELECT id FROM runs WHERE id=?", (run_id,)).fetchone()
+            snapshot_hook()
+        run = get_run(conn, run_id)
+        checkpoint_updates = int(run["updates_done"])
+        checkpoint_samples = int(run["samples_done"])
+
+        problems: list[str] = []
+        problem_count = 0
+
+        def report(message: str) -> None:
+            nonlocal problem_count
+            problem_count += 1
+            if len(problems) < AUDIT_MAX_PROBLEMS:
+                problems.append(message)
+
+        w, b, v_w, v_b = run["init_w"], run["init_b"], 0.0, 0.0
+        replayed_samples = 0
+        replayed_updates = 0
+        prev_offset = int(run["data_start"])
+
+        # Snapshot read, bounded by the checkpoint: rows committed after the
+        # checkpoint are not part of it and are not replayed.  The cursor is
+        # iterated lazily so no list of all groups is ever materialised.
+        cursor = conn.execute(
+            f"SELECT {_AUDIT_ROW_COLUMNS} FROM updates "
+            "WHERE run_id=? AND idx<? ORDER BY idx",
+            (run_id, checkpoint_updates),
+        )
+        for rec in cursor:
+            if rec["idx"] != replayed_updates:
+                report(f"更新序号不连续：期望 {replayed_updates}，实际 {rec['idx']}")
+            if rec["offset_before"] != prev_offset:
+                report(f"更新 {rec['idx']} 的起始偏移与上次结束偏移不衔接")
+            prev_offset = int(rec["offset_after"])
+            replayed_samples += int(rec["samples"])
+            v_w = run["momentum"] * v_w - run["lr"] * rec["grad_w"]
+            v_b = run["momentum"] * v_b - run["lr"] * rec["grad_b"]
+            w += v_w
+            b += v_b
+            if not (w == rec["w_after"] and b == rec["b_after"]):
+                report(f"更新 {rec['idx']} 的参数与审计记录不一致")
+            if not (v_w == rec["v_w"] and v_b == rec["v_b"]):
+                report(f"更新 {rec['idx']} 的动量与审计记录不一致")
+            replayed_updates += 1
+        cursor.close()
+
+        if replayed_updates != checkpoint_updates:
+            report(
+                f"更新数不一致：审计 {replayed_updates}，断点 {checkpoint_updates}"
+            )
+        # Rows beyond the checkpoint would mean the checkpoint is stale relative
+        # to its own table; count them without loading them.  A shortfall is
+        # already reported above by the replayed count, so only report extras.
+        total_rows = conn.execute(
+            "SELECT COUNT(*) FROM updates WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+        if total_rows > checkpoint_updates:
+            report(f"更新记录总数 {total_rows} 超过断点 {checkpoint_updates}")
+        if replayed_samples != checkpoint_samples:
+            report(
+                f"样本累计不一致：审计 {replayed_samples}，断点 {checkpoint_samples}"
+            )
+        if not (w == run["w"] and b == run["b"]):
+            report("最终参数与断点记录不一致")
+        if not (v_w == run["v_w"] and v_b == run["v_b"]):
+            report("最终动量与断点记录不一致")
+        part_rows = int(run["part_rows"])
+        if part_rows < 0 or part_rows >= max(1, int(run["group_size"])):
+            report("未成组的累计行数超出每组样本数")
+        if checkpoint_samples + part_rows > run["total_rows"]:
+            report("已计入样本 + 未成组行数超过总行数")
+        if part_rows == 0:
+            if run["next_offset"] != prev_offset:
+                report("next_offset 与最后一条更新记录不一致")
+            if int(run["part_gw"]) != 0 or int(run["part_loss"]) != 0:
+                report("未成组累计应为空")
+        else:
+            if run["next_offset"] == prev_offset:
+                report("存在未成组累计但读取偏移未前进")
+            if int(run["part_start_offset"]) != prev_offset:
+                report("未成组的起始偏移与上次结束偏移不衔接")
+        if run["status"] == "finished":
+            if checkpoint_samples != run["total_rows"] or part_rows != 0:
+                report("已结束但样本数不等于总行数")
+            expected_groups = (run["total_rows"] + run["group_size"] - 1) // run["group_size"]
+            if checkpoint_updates != expected_groups:
+                report("已结束但更新次数不等于组数")
+
     return {
-        "ok": not problems,
+        "ok": problem_count == 0,
+        "problem_count": problem_count,
         "problems": problems,
-        "updates": len(rows),
-        "samples": samples,
-        "part_rows": part_rows,
-        "w": w,
-        "b": b,
-        "v_w": v_w,
-        "v_b": v_b,
+        "problems_truncated": problem_count > len(problems),
+        "max_problems": AUDIT_MAX_PROBLEMS,
+        "updates": checkpoint_updates,
+        "samples": checkpoint_samples,
+        "part_rows": int(run["part_rows"]),
+        "w": run["w"],
+        "b": run["b"],
+        "v_w": run["v_w"],
+        "v_b": run["v_b"],
+        "replayed": {
+            "updates": replayed_updates,
+            "samples": replayed_samples,
+            "w": w,
+            "b": b,
+            "v_w": v_w,
+            "v_b": v_b,
+        },
         "run": run,
     }
